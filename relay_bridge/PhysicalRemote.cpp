@@ -4,19 +4,18 @@
 #include "config.h"
 
 #include <NimBLEDevice.h>
+#include <atomic>
 #include "host/ble_store.h"
 
 namespace PhysicalRemote {
 
-static bool remoteConnected = false;
-static bool remoteSecurityReady = false;
-static bool remoteDoConnect = false;
-static uint32_t remoteRetryAt = 0;
+static std::atomic<bool> remoteConnected{false};
+static std::atomic<bool> remoteSecurityReady{false};
+static std::atomic<bool> remoteDoConnect{false};
+static std::atomic<uint32_t> remoteRetryAt{0};
 
-static const NimBLEAdvertisedDevice *remoteAdv = nullptr;
-static NimBLEAddress remoteConnectAddr(ORIGINAL_REMOTE_MAC, BLE_ADDR_PUBLIC);
+static const NimBLEAddress remoteConnectAddr(ORIGINAL_REMOTE_MAC, BLE_ADDR_PUBLIC);
 static NimBLEClient *remoteClient = nullptr;
-static NimBLERemoteCharacteristic *remoteReport1 = nullptr;
 
 static bool remoteBootOurSecValid = false;
 static bool remoteBootPeerSecValid = false;
@@ -48,7 +47,6 @@ class RemoteClientCallbacks : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient *, int reason) override {
     remoteConnected = false;
     remoteSecurityReady = false;
-    remoteReport1 = nullptr;
     remoteDoConnect = false;
     remoteRetryAt = millis() + 3000;
 
@@ -57,17 +55,17 @@ class RemoteClientCallbacks : public NimBLEClientCallbacks {
   }
 
   void onAuthenticationComplete(NimBLEConnInfo& info) override {
-    remoteSecurityReady = info.isEncrypted();
-
     if (info.isEncrypted()) {
       Serial.printf("[REMOTE] Security restored bonded=%d peer=%s\n",
                     info.isBonded(), info.getAddress().toString().c_str());
       forcePersistSecurityIfChanged();
+      remoteSecurityReady = true;
       return;
     }
 
     Serial.printf("[REMOTE] Security failed peer=%s\n",
                   info.getAddress().toString().c_str());
+    remoteSecurityReady = false;
 
     NimBLEClient *client =
         NimBLEDevice::getClientByHandle(info.getConnHandle());
@@ -91,17 +89,19 @@ static bool advHasMfg(const NimBLEAdvertisedDevice *device,
 
 class RemoteScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *device) override {
+    if (remoteConnected || remoteDoConnect) return;
     const NimBLEAddress configuredRemote(ORIGINAL_REMOTE_MAC, BLE_ADDR_PUBLIC);
 
     const bool targetAddr =
         !device->getAddress().isNull() &&
         device->getAddress() == configuredRemote;
 
-    const bool targetName =
-        device->haveName() &&
-        device->getName() == ORIGINAL_REMOTE_NAME;
-
-    if (!targetAddr && !targetName) return;
+    // A known, different address must never match just by name. Preserve the
+    // documented null-address workaround: use its name only as a wake hint,
+    // then always connect to the configured public identity, never that hint.
+    const bool nullAddressHint = device->getAddress().isNull() &&
+        device->haveName() && device->getName() == ORIGINAL_REMOTE_NAME;
+    if (!targetAddr && !nullAddressHint) return;
     if (!device->isConnectable()) return;
 
     const bool mfg0400 = advHasMfg(device, 0x02, 0x7D, 0x04, 0x00);
@@ -112,27 +112,15 @@ class RemoteScanCallbacks : public NimBLEScanCallbacks {
                   device->getRSSI(),
                   mfg0400 ? "04 00" : (mfg0411 ? "04 11" : "other"));
 
-    remoteAdv = device;
-    remoteConnectAddr = device->getAddress().isNull()
-        ? NimBLEAddress(ORIGINAL_REMOTE_MAC, BLE_ADDR_PUBLIC)
-        : device->getAddress();
-
     NimBLEDevice::getScan()->stop();
     remoteDoConnect = true;
   }
-
-  void onScanEnd(const NimBLEScanResults&, int) override {
-    if (!remoteConnected && !remoteDoConnect) {
-      NimBLEDevice::getScan()->start(0, false, true);
-    }
-  }
+  // The worker owns scan/retry scheduling, including unexpected scan ends.
 };
 
 static RemoteScanCallbacks remoteScanCallbacks;
 
 static bool connectRemote() {
-  if (!remoteAdv) return false;
-
   remoteClient = NimBLEDevice::getClientByPeerAddress(remoteConnectAddr);
   if (!remoteClient) remoteClient = NimBLEDevice::getDisconnectedClient();
 
@@ -186,7 +174,7 @@ static bool connectRemote() {
     return false;
   }
 
-  remoteReport1 = nullptr;
+  NimBLERemoteCharacteristic *remoteReport1 = nullptr;
 
   const auto& reportChars = hid->getCharacteristics(true);
   for (auto *chr : reportChars) {
@@ -218,7 +206,7 @@ static bool connectRemote() {
     return false;
   }
 
-  remoteConnected = true;
+  if (!remoteClient->isConnected()) return false;
   Serial.println("[REMOTE] Physical remote relay ready");
   return true;
 }
@@ -230,12 +218,16 @@ static void startScan() {
   remoteRetryAt = 0;
 
   NimBLEScan *scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) return;
   scan->setScanCallbacks(&remoteScanCallbacks, false);
   scan->setDuplicateFilter(1);
   scan->setInterval(100);
   scan->setWindow(80);
   scan->setActiveScan(true);
-  scan->start(0, false, true);
+  if (!scan->start(0, false, true)) {
+    remoteRetryAt = millis() + 3000;
+    Serial.println("[REMOTE] Scan start failed; retry in 3000 ms");
+  }
 }
 
 static bool readSecurityStore(struct ble_store_value_sec *our,
@@ -347,30 +339,31 @@ bool isConnected() {
   return remoteConnected;
 }
 
+static void remoteTask(void *) {
+  for (;;) {
+    if (remoteDoConnect.exchange(false)) {
+      // NimBLE connection, encryption and GATT discovery can block for many
+      // seconds. Keep them off the Arduino/HomeKit/MQTT loop task.
+      if (!connectRemote() && !remoteRetryAt) remoteRetryAt = millis() + 3000;
+    }
+    if (!remoteConnected && !remoteDoConnect) startScan();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
 void begin() {
   captureBootSecurityStore();
 
   Serial.printf("[REMOTE] Bond=%d target=%s\n",
                 hasBond(), ORIGINAL_REMOTE_MAC);
 
-  startScan();
+  if (xTaskCreate(remoteTask, "physical-remote", 6144, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("[REMOTE] Worker task creation failed; remote relay unavailable");
+  }
 }
 
 void loop() {
-  if (remoteDoConnect) {
-    remoteDoConnect = false;
-
-    if (!connectRemote() && !remoteRetryAt) {
-      remoteRetryAt = millis() + 3000;
-    }
-  }
-
-  if (!remoteConnected &&
-      !remoteDoConnect &&
-      remoteRetryAt &&
-      (int32_t)(millis() - remoteRetryAt) >= 0) {
-    startScan();
-  }
+  // Connection/retry work is handled by remoteTask; retained for orchestration.
 }
 
 }  // namespace PhysicalRemote

@@ -3,6 +3,7 @@
 #include "config.h"
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
+#include <atomic>
 
 namespace HonorBle {
 
@@ -12,7 +13,7 @@ static NimBLECharacteristic *inputReport2 = nullptr;
 static NimBLECharacteristic *inputReport5A = nullptr;
 static NimBLECharacteristic *outputReport5A = nullptr;
 
-static bool bleConnected = false;
+static std::atomic<bool> bleConnected{false};
 static bool tvBondedThisBoot = false;
 static bool wakePulseActive = false;
 static uint32_t wakePulseUntil = 0;

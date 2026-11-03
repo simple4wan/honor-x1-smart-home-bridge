@@ -58,6 +58,10 @@ HomeKit 和 Home Assistant 是两个独立的上层控制入口，最终都调�
 - 原装实体遥控器实时中继
 - ESP32 重启后恢复原装遥控器 Bond
 - 修复同地址重新配对后的 NimBLE Security Store 持久化问题
+- BLE 状态通过原子邮箱交给主循环更新 HomeKit，避免跨任务修改 HomeSpan
+- 原装遥控器连接 / 加密等待 / GATT 发现由独立任务处理，避免阻塞 HomeKit / MQTT 主循环
+- 扫描拒绝地址明确不匹配的同名遥控器；连接始终使用配置的 Public MAC
+- MQTT 状态发布失败后自动重试
 - GitHub Actions 自动生成 factory / update 固件
 
 ---
@@ -329,6 +333,10 @@ VolumeSelector：
 1 = Volume -
 ```
 
+静音保留遥控器按键语义：按一次静音，再按一次恢复原来音量。
+HomeKit 每次写入 Mute 都发送一次 MUTE 切换键；电视没有静音状态反馈，
+HomeKit 显示值不能作为电视实际静音状态的确认。原装遥控器和 MQTT MUTE 同样可用。
+
 ---
 
 # 开关机
@@ -516,6 +524,9 @@ PEER_SEC
 ---
 
 # 固件
+
+GitHub Actions 在推送 `main` 或提交 Pull Request 时运行适配层回归测试，
+并按上述版本编译 ESP32-C3 固件。测试范围与实机验证步骤见 [tests/README.md](tests/README.md)。
 
 GitHub Actions 生成：
 

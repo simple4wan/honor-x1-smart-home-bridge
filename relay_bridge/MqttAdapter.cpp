@@ -28,10 +28,14 @@ static void publishState(bool force = false) {
   const bool state = HonorBle::isTvConnected();
   if (!force && lastTvStateValid && state == lastTvState) return;
 
-  lastTvState = state;
-  lastTvStateValid = true;
-
-  mqtt.publish(topic("state").c_str(), state ? "ON" : "OFF", true);
+  if (mqtt.publish(topic("state").c_str(), state ? "ON" : "OFF", true)) {
+    lastTvState = state;
+    lastTvStateValid = true;
+  } else {
+    // A failed forced publish must also invalidate a previously cached value.
+    // Retry on the next loop, even if the TV has not changed state.
+    lastTvStateValid = false;
+  }
 }
 
 static bool parseKey(const String& payload, uint8_t& key) {
