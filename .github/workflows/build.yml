@@ -2,6 +2,9 @@ name: Build Honor X1 Smart Home Bridge
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -12,6 +15,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Test adapter regressions
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread -Itests/stubs tests/adapter_regression.cpp -o /tmp/adapter-regression
+          /tmp/adapter-regression
 
       - name: Install Arduino CLI
         run: |

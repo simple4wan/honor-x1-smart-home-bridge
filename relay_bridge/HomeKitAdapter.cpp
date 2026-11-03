@@ -2,17 +2,17 @@
 
 #include "HonorBleBridge.h"
 #include "HomeSpan.h"
+#include <atomic>
 
 namespace HomeKitAdapter {
 
 static SpanCharacteristic *activeCharacteristic = nullptr;
+static std::atomic<int> pendingTvState{-1};
 
 static void syncTvState(bool connected) {
-  if (!activeCharacteristic) return;
-
-  activeCharacteristic->setVal(connected ? 1 : 0);
-  Serial.printf("[HK] Active synced -> %s\n",
-                connected ? "ON" : "OFF");
+  // NimBLE invokes this from its host task. HomeSpan characteristics and its
+  // notification vector belong to the task that calls homeSpan.poll().
+  pendingTvState.store(connected ? 1 : 0);
 }
 
 struct HonorTelevision : Service::Television {
@@ -72,6 +72,8 @@ struct HonorSpeaker : Service::TelevisionSpeaker {
           : HonorBle::VOLUME_DOWN);
     }
 
+    // The TV exposes a toggle key, so retain the remote-button behavior:
+    // each HomeKit write toggles mute; this is not TV mute-state feedback.
     if (mute->updated()) {
       HonorBle::sendKey(HonorBle::MUTE);
     }
@@ -107,6 +109,11 @@ void begin() {
 
 void loop() {
   homeSpan.poll();
+  const int state = pendingTvState.exchange(-1);
+  if (state >= 0 && activeCharacteristic) {
+    activeCharacteristic->setVal(state);
+    Serial.printf("[HK] Active synced -> %s\n", state ? "ON" : "OFF");
+  }
 }
 
 }  // namespace HomeKitAdapter
